@@ -12,6 +12,18 @@ To run:
 bun run src/main.ts -- "What's the weather in Perth, Western Australia?"
 ```
 
+The agent now also has a `search_web` tool for public web lookup. For example:
+
+```bash
+bun run src/main.ts -- "Search the web for the latest Bun 1.3 release notes and summarize the top results."
+```
+
+It also has a `get_datetime` tool for current date/time questions. For example:
+
+```bash
+bun run src/main.ts -- "What time is it in Australia/Perth right now?"
+```
+
 To override the model endpoint:
 
 ```bash
@@ -30,13 +42,28 @@ To print CLI help:
 bun run src/main.ts --help
 ```
 
-`get_weather` resolves the city through Open-Meteo geocoding and then fetches current conditions from Open-Meteo's forecast API, so the tool now requires outbound internet access when it runs. If a city name is ambiguous, include `country` or `region`. Common country codes like `US`, `USA`, `UK`, and `AU` are normalized, and selected region abbreviations like `WA` are supported where the mapping is unambiguous. If your filter misses, the tool now returns the exact city matches it did find.
+To suppress backend progress logs:
+
+```bash
+bun run src/main.ts --quiet -- "What's the weather in Perth, Western Australia?"
+```
+
+`get_weather` resolves the city through Open-Meteo geocoding and then fetches current conditions from Open-Meteo's forecast API, so the tool requires outbound internet access when it runs. If a city name is ambiguous, include `country` or `region`. Common country codes like `US`, `USA`, `UK`, and `AU` are normalized, and selected region abbreviations like `WA` are supported where the mapping is unambiguous. If your filter misses, the tool returns the exact city matches it did find.
+
+`search_web` uses DuckDuckGo's HTML search endpoint and returns a short result list with titles, URLs, and snippets. It also requires outbound internet access when it runs.
+
+`get_datetime` returns the current UTC timestamp plus a stable `date`, `time`, and `dateTime` in either the local default timezone or an explicitly requested IANA timezone like `UTC` or `Australia/Perth`.
 
 The CLI no longer falls back to a hidden default prompt. You must pass an explicit request.
 Unknown flags are rejected, and `--base-url` must be a valid `http` or `https` URL.
 `--timeout-ms` must be a positive integer.
+Use `--quiet` to suppress backend progress trace output.
 
 This project now defaults to first-principles reasoning plus the 5-step improvement loop documented in [AGENTS.md](./AGENTS.md). The runtime agent prompt follows the same standard by default.
+
+The runtime now also enforces two validation cycles before it accepts a final answer. After each draft answer, the agent is prompted to check for unsupported claims, contradictions, stale assumptions, missing edge cases, and calculation mistakes. If a review finds a gap, it can call another tool and restart the validation cycle with the new evidence.
+
+When you run the CLI, backend progress is printed to `stderr` with `[agent]` prefixes so you can see model turns, validation passes, and tool calls while the final answer remains on `stdout`.
 
 The model protocol is JSON-only and uses these response shapes:
 

@@ -19,6 +19,7 @@ test("parses input and base-url arguments", () => {
   ).toEqual({
     input: "What's the weather?",
     baseUrl: "http://127.0.0.1:9999",
+    quiet: false,
     showHelp: false,
     model: "test-model",
     timeoutMs: 5000,
@@ -29,6 +30,7 @@ test("does not default to a hidden Perth query when no input is provided", () =>
   expect(parseCliArgs([])).toEqual({
     input: null,
     baseUrl: "http://127.0.0.1:9000",
+    quiet: false,
     showHelp: false,
   });
 });
@@ -37,12 +39,23 @@ test("supports help flags", () => {
   expect(parseCliArgs(["--help"])).toEqual({
     input: null,
     baseUrl: "http://127.0.0.1:9000",
+    quiet: false,
     showHelp: true,
   });
   expect(parseCliArgs(["-h"])).toEqual({
     input: null,
     baseUrl: "http://127.0.0.1:9000",
+    quiet: false,
     showHelp: true,
+  });
+});
+
+test("supports quiet flag", () => {
+  expect(parseCliArgs(["--quiet", "Hello"])).toEqual({
+    input: "Hello",
+    baseUrl: "http://127.0.0.1:9000",
+    quiet: true,
+    showHelp: false,
   });
 });
 
@@ -86,6 +99,7 @@ test("treats tokens after -- as prompt text", () => {
   expect(parseCliArgs(["--", "--base-url", "hello"])).toEqual({
     input: "--base-url hello",
     baseUrl: "http://127.0.0.1:9000",
+    quiet: false,
     showHelp: false,
   });
 });
@@ -98,6 +112,7 @@ test("main forwards parsed options to runAgent", async () => {
         options: {
           model?: string;
           timeoutMs?: number;
+          trace?: (message: string) => void;
         };
       }
     | undefined;
@@ -126,14 +141,40 @@ test("main forwards parsed options to runAgent", async () => {
     ),
   ).resolves.toBe("ok");
 
-  expect(captured).toEqual({
-    input: "Hello",
-    baseUrl: "http://127.0.0.1:9999",
-    options: {
-      model: "test-model",
-      timeoutMs: 5000,
-    },
-  });
+  expect(captured?.input).toBe("Hello");
+  expect(captured?.baseUrl).toBe("http://127.0.0.1:9999");
+  expect(captured?.options.model).toBe("test-model");
+  expect(captured?.options.timeoutMs).toBe(5000);
+  expect(captured?.options.trace).toBeTypeOf("function");
+});
+
+test("main suppresses trace forwarding in quiet mode", async () => {
+  let captured:
+    | {
+        input: string;
+        baseUrl: string;
+        options: {
+          model?: string;
+          timeoutMs?: number;
+          trace?: (message: string) => void;
+        };
+      }
+    | undefined;
+
+  const runAgent = async (
+    input: string,
+    baseUrl: string,
+    options: { model?: string; timeoutMs?: number; trace?: (message: string) => void } = {},
+  ) => {
+    captured = { input, baseUrl, options };
+    return "ok";
+  };
+
+  await expect(main(["--quiet", "Hello"], { runAgent })).resolves.toBe("ok");
+
+  expect(captured?.input).toBe("Hello");
+  expect(captured?.baseUrl).toBe("http://127.0.0.1:9000");
+  expect(captured?.options.trace).toBeUndefined();
 });
 
 test("formats model client errors without stack output", () => {

@@ -24,7 +24,9 @@ test("returns a direct final answer without using a tool", async () => {
     return { type: "final", text: "Hi there." };
   };
 
-  await expect(runAgentWithModel("Hello", model)).resolves.toBe("Hi there.");
+  await expect(
+    runAgentWithModel("Hello", model, { validationCycles: 0 }),
+  ).resolves.toBe("Hi there.");
 });
 
 test("supports multiple tool turns before the final answer", async () => {
@@ -98,7 +100,10 @@ test("supports multiple tool turns before the final answer", async () => {
   };
 
   await expect(
-    runAgentWithModel("What's the weather in Perth?", model, { toolExecutor }),
+    runAgentWithModel("What's the weather in Perth?", model, {
+      toolExecutor,
+      validationCycles: 0,
+    }),
   ).resolves.toBe("Perth is clear and Berlin is rainy.");
 
   expect(calls).toHaveLength(3);
@@ -167,7 +172,10 @@ test("passes tool errors back to the model as structured tool output", async () 
   };
 
   await expect(
-    runAgentWithModel("What's the weather in Perth?", model, { toolExecutor }),
+    runAgentWithModel("What's the weather in Perth?", model, {
+      toolExecutor,
+      validationCycles: 0,
+    }),
   ).resolves.toBe(
     "Please specify which Perth you mean, for example Perth, Australia or Perth, Scotland.",
   );
@@ -203,9 +211,11 @@ test("passes unknown tool requests back to the model instead of crashing", async
     };
   };
 
-  await expect(runAgentWithModel("Latest weather headlines?", model)).resolves.toBe(
-    "I do not have a get_news tool available.",
-  );
+  await expect(
+    runAgentWithModel("Latest weather headlines?", model, {
+      validationCycles: 0,
+    }),
+  ).resolves.toBe("I do not have a get_news tool available.");
 });
 
 test("stops after the configured max step count", async () => {
@@ -216,6 +226,216 @@ test("stops after the configured max step count", async () => {
   });
 
   await expect(
-    runAgentWithModel("Loop forever", model, { maxSteps: 2 }),
+    runAgentWithModel("Loop forever", model, { maxSteps: 2, validationCycles: 0 }),
   ).rejects.toThrow("Max steps exceeded: 2");
+});
+
+test("performs multiple validation cycles before accepting a final answer", async () => {
+  const calls: TranscriptMessage[][] = [];
+  const model: ModelClient = async (messages) => {
+    calls.push(messages.map((message) => ({ ...message })));
+
+    if (calls.length === 1) {
+      expect(messages[0]?.content).toContain(
+        "The runtime will enforce 2 validation cycle(s) before it accepts any final answer.",
+      );
+      return { type: "final", text: "Initial answer." };
+    }
+
+    if (calls.length === 2) {
+      expect(messages[2]).toEqual({
+        role: "assistant",
+        content: JSON.stringify({
+          type: "final",
+          text: "Initial answer.",
+        }),
+      });
+      expect(messages[3]).toEqual({
+        role: "user",
+        content: [
+          "Validation cycle 1 of 2.",
+          "Review the latest draft answer against the original request and every tool result so far.",
+          "Look for unsupported claims, contradictions, stale data, hidden assumptions, and calculation mistakes.",
+          'Draft answer to review: "Initial answer."',
+          "If more evidence or checking is required, respond with a tool call JSON.",
+          "If the answer is fully supported, respond with an improved final JSON answer.",
+          "Respond ONLY with valid JSON.",
+        ].join("\n"),
+      });
+      return { type: "final", text: "Revised answer." };
+    }
+
+    expect(messages[4]).toEqual({
+      role: "assistant",
+      content: JSON.stringify({
+        type: "final",
+        text: "Revised answer.",
+      }),
+    });
+    expect(messages[5]).toEqual({
+      role: "user",
+      content: [
+        "Validation cycle 2 of 2.",
+        "Review the latest draft answer against the original request and every tool result so far.",
+        "Look for unsupported claims, contradictions, stale data, hidden assumptions, and calculation mistakes.",
+        'Draft answer to review: "Revised answer."',
+        "If more evidence or checking is required, respond with a tool call JSON.",
+        "If the answer is fully supported, respond with an improved final JSON answer.",
+        "Respond ONLY with valid JSON.",
+      ].join("\n"),
+    });
+
+    return { type: "final", text: "Best checked answer." };
+  };
+
+  await expect(runAgentWithModel("Hello", model)).resolves.toBe(
+    "Best checked answer.",
+  );
+  expect(calls).toHaveLength(3);
+});
+
+test("restarts validation cycles after a tool call adds new evidence", async () => {
+  const calls: TranscriptMessage[][] = [];
+  const toolExecutor: NonNullable<AgentRunOptions["toolExecutor"]> = async () => ({
+    ok: true as const,
+    tool: "search_web",
+    result: {
+      provider: "duckduckgo",
+      query: "latest result",
+      results: [
+        {
+          title: "Checked source",
+          url: "https://example.com/source",
+          snippet: "Validated data",
+        },
+      ],
+    },
+  });
+  const model: ModelClient = async (messages) => {
+    calls.push(messages.map((message) => ({ ...message })));
+
+    if (calls.length === 1) {
+      return { type: "final", text: "Draft without enough evidence." };
+    }
+
+    if (calls.length === 2) {
+      expect(messages[3]?.content).toContain("Validation cycle 1 of 1.");
+      return {
+        type: "tool",
+        tool: "search_web",
+        arguments: { query: "latest result" },
+      };
+    }
+
+    if (calls.length === 3) {
+      expect(messages[5]).toEqual({
+        role: "user",
+        content: [
+          "Tool result:",
+          JSON.stringify({
+            ok: true,
+            tool: "search_web",
+            result: {
+              provider: "duckduckgo",
+              query: "latest result",
+              results: [
+                {
+                  title: "Checked source",
+                  url: "https://example.com/source",
+                  snippet: "Validated data",
+                },
+              ],
+            },
+          }),
+          "Use this result to continue. Respond ONLY with valid JSON.",
+        ].join("\n"),
+      });
+      return { type: "final", text: "Answer with evidence." };
+    }
+
+    expect(messages[7]?.content).toContain("Validation cycle 1 of 1.");
+    return { type: "final", text: "Best checked answer." };
+  };
+
+  await expect(
+    runAgentWithModel("Find the latest result", model, {
+      toolExecutor,
+      validationCycles: 1,
+    }),
+  ).resolves.toBe("Best checked answer.");
+
+  expect(calls).toHaveLength(4);
+});
+
+test("emits trace lines for model turns, validation, and tool execution", async () => {
+  const trace: string[] = [];
+  const toolExecutor: NonNullable<AgentRunOptions["toolExecutor"]> = async () => ({
+    ok: true as const,
+    tool: "search_web",
+    result: {
+      provider: "duckduckgo",
+      query: "perth time",
+      results: [
+        {
+          title: "Perth time",
+          url: "https://example.com/perth-time",
+          snippet: "UTC+8",
+        },
+      ],
+    },
+  });
+  let callCount = 0;
+  const model: ModelClient = async () => {
+    callCount += 1;
+
+    if (callCount === 1) {
+      return { type: "final", text: "Draft answer." };
+    }
+
+    if (callCount === 2) {
+      return {
+        type: "tool",
+        tool: "search_web",
+        arguments: { query: "perth time" },
+      };
+    }
+
+    if (callCount === 3) {
+      return { type: "final", text: "Revised answer." };
+    }
+
+    return { type: "final", text: "Best checked answer." };
+  };
+
+  await expect(
+    runAgentWithModel("What time is it in Perth?", model, {
+      toolExecutor,
+      validationCycles: 1,
+      trace: (message) => trace.push(message),
+    }),
+  ).resolves.toBe("Best checked answer.");
+
+  expect(trace).toEqual([
+    "Starting agent run with maxSteps=12 and validationCycles=1.",
+    "Step 1/12: requesting model response.",
+    "Step 1/12: draft answer produced. Starting validation cycle 1/1.",
+    "Step 2/12: requesting model response.",
+    'Step 2/12: calling tool search_web with arguments {"query":"perth time"}.',
+    "Step 2/12: tool search_web succeeded.",
+    "Step 2/12: validation cycle reset after new tool evidence.",
+    "Step 3/12: requesting model response.",
+    "Step 3/12: draft answer produced. Starting validation cycle 1/1.",
+    "Step 4/12: requesting model response.",
+    "Step 4/12: final answer accepted.",
+  ]);
+});
+
+test("rejects invalid validation cycle counts", async () => {
+  const model: ModelClient = async () => ({ type: "final", text: "Hi" });
+
+  await expect(
+    runAgentWithModel("Hello", model, { validationCycles: -1 }),
+  ).rejects.toThrow(
+    "Invalid validationCycles: -1. Expected a non-negative integer.",
+  );
 });

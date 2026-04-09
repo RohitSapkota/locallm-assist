@@ -1,7 +1,13 @@
 import { createToolRegistry } from "./registry";
+import { getDateTimeTool } from "./datetime/tool";
+import { searchWebTool } from "./web-search/tool";
 import { getWeatherTool } from "./weather/tool";
 
-export const toolRegistry = createToolRegistry([getWeatherTool]);
+export const toolRegistry = createToolRegistry([
+  getDateTimeTool,
+  getWeatherTool,
+  searchWebTool,
+]);
 
 export function getToolPromptLines() {
   return toolRegistry.getPromptLines();

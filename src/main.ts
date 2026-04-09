@@ -1,4 +1,4 @@
-import { runAgent as defaultRunAgent } from "./agent";
+import { runAgent as defaultRunAgent, type AgentTraceWriter } from "./agent";
 import { ModelClientError } from "./llm";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:9000";
@@ -6,12 +6,13 @@ const SUPPORTED_PROTOCOLS = new Set(["http:", "https:"]);
 
 export const CLI_USAGE = [
   "Usage:",
-  '  bun run src/main.ts [--base-url URL] [--model MODEL] [--timeout-ms MS] "your request"',
+  '  bun run src/main.ts [--base-url URL] [--model MODEL] [--timeout-ms MS] [--quiet] "your request"',
   "",
   "Options:",
   "  --base-url URL   Model server base URL (http/https)",
   "  --model MODEL    Model name to send to the backend",
   "  --timeout-ms MS  Request timeout in milliseconds",
+  "  --quiet          Suppress backend progress trace output",
   "  -h, --help       Show this help text",
 ].join("\n");
 
@@ -29,6 +30,12 @@ type MainDependencies = {
 const DEFAULT_MAIN_DEPENDENCIES: MainDependencies = {
   runAgent: defaultRunAgent,
 };
+
+function createCliTraceWriter(): AgentTraceWriter {
+  return (message) => {
+    console.error(`[agent] ${message}`);
+  };
+}
 
 function parseBaseUrl(value: string) {
   let parsed: URL;
@@ -70,6 +77,7 @@ export function parseCliArgs(argv: string[]) {
   const inputParts: string[] = [];
   let baseUrl = DEFAULT_BASE_URL;
   let showHelp = false;
+  let quiet = false;
   let endOfFlags = false;
   let model: string | undefined;
   let timeoutMs: number | undefined;
@@ -87,6 +95,11 @@ export function parseCliArgs(argv: string[]) {
 
     if (!endOfFlags && (arg === "--help" || arg === "-h")) {
       showHelp = true;
+      continue;
+    }
+
+    if (!endOfFlags && arg === "--quiet") {
+      quiet = true;
       continue;
     }
 
@@ -119,6 +132,7 @@ export function parseCliArgs(argv: string[]) {
   return {
     input: inputParts.join(" ").trim() || null,
     baseUrl,
+    quiet,
     showHelp,
     ...(model !== undefined ? { model } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
@@ -141,7 +155,7 @@ export async function main(
   argv = process.argv.slice(2),
   dependencies: MainDependencies = DEFAULT_MAIN_DEPENDENCIES,
 ) {
-  const { input, baseUrl, showHelp, model, timeoutMs } = parseCliArgs(argv);
+  const { input, baseUrl, quiet, showHelp, model, timeoutMs } = parseCliArgs(argv);
   if (showHelp) {
     return CLI_USAGE;
   }
@@ -150,7 +164,11 @@ export async function main(
     throw new CliUsageError("Missing request text.");
   }
 
-  return dependencies.runAgent(input, baseUrl, { model, timeoutMs });
+  return dependencies.runAgent(input, baseUrl, {
+    model,
+    timeoutMs,
+    ...(quiet ? {} : { trace: createCliTraceWriter() }),
+  });
 }
 
 if (import.meta.main) {
