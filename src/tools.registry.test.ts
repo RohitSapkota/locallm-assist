@@ -36,7 +36,7 @@ test("registry exposes prompt metadata for each tool", () => {
   expect(lines).toHaveLength(1);
   expect(lines[0]).toContain("- echo: Echo text back to the user.");
   expect(lines[0]).toContain(
-    "Use when: Use when the user explicitly asks to repeat or echo text.",
+    "Use when: the user explicitly asks to repeat or echo text",
   );
   expect(lines[0]).toContain("Arguments: text (required string).");
   expect(lines[0]).toContain('Example arguments: {"text":"hello"}');

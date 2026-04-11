@@ -1,5 +1,6 @@
 import {
   createModelClient,
+  DEFAULT_MAX_OUTPUT_TOKENS,
   type ModelClient,
   type ModelClientOptions,
   type ModelResult,
@@ -14,38 +15,35 @@ import { executeToolCall as defaultExecuteToolCall, getToolPromptLines } from ".
 
 const MAX_AGENT_STEPS = 12;
 const DEFAULT_VALIDATION_CYCLES = 2;
+const DEFAULT_VALIDATION_MODE = "always";
+export const VALIDATION_MODES = ["always", "after_tool", "off"] as const;
+export type ValidationMode = (typeof VALIDATION_MODES)[number];
 
-function buildSystemPrompt(validationCycles: number) {
+function buildSystemPrompt(
+  validationCycles: number,
+  validationMode: ValidationMode,
+) {
   const lines = [
     "You are a tool-using assistant.",
-    "Default operating standard: use first-principles reasoning and this 5-step order on every task.",
-    "1. Question every requirement and separate facts from assumptions.",
-    "2. Delete unnecessary parts, steps, and assumptions before improving anything.",
-    "3. Simplify and optimize only what remains.",
-    "4. Accelerate feedback loops and cycle time after the design is right.",
-    "5. Automate only after the process is stable and worth repeating.",
-    "Prefer the smallest truthful solution, and call out weak requirements or hidden assumptions when they materially affect the answer.",
-    "Use a tool only when the user's request actually requires that tool.",
-    "If the request can be answered without a tool, respond with a final answer.",
-    "Do not invent missing tool arguments or facts; ask for clarification when required data is missing.",
-    "Available tools:",
-    ...getToolPromptLines(),
-    'After you request a tool, you will receive a user message that starts with "Tool result:" followed by JSON.',
-    "Respond ONLY with valid JSON using one of these shapes.",
+    "Use first-principles reasoning: question assumptions, remove unnecessary steps, then answer directly.",
+    "Prefer the smallest truthful answer grounded in the request and tool results.",
     '{"type":"final","text":"Plain-language answer for the user"}',
     '{"type":"tool","tool":"tool_name","arguments":{"required_argument":"value"}}',
-    "Do not use markdown fences.",
-    "If a tool result includes an error, use it to ask the user a clarifying question or give the best next step.",
+    "Reply with JSON only. Do not use markdown fences.",
+    "Use a tool only when needed. If the request can be answered without a tool, return a final answer.",
+    "Do not invent facts or missing tool arguments. Ask for clarification with a final answer when needed.",
+    'After a tool call, you will receive a user message starting with "Tool result:" followed by JSON.',
+    "If a tool returns an error, ask for clarification or give the next step.",
+    "Tools:",
+    ...getToolPromptLines(),
   ];
 
-  if (validationCycles > 0) {
-    lines.splice(
-      10,
-      0,
-      `The runtime will enforce ${validationCycles} validation cycle(s) before it accepts any final answer.`,
-      "Use each validation cycle to aggressively check for unsupported claims, contradictions, stale assumptions, missing edge cases, and calculation mistakes.",
-      "If a validation cycle shows missing evidence, request another tool instead of forcing a final answer.",
-    );
+  if (validationCycles > 0 && validationMode !== "off") {
+    lines.splice(6, 0, [
+      `The runtime may request up to ${validationCycles} validation pass(es).`,
+      "On validation, check the draft against the request and tool results.",
+      "If evidence is missing, call a tool. Otherwise return improved final JSON.",
+    ].join(" "));
   }
 
   return lines.join("\n");
@@ -57,14 +55,176 @@ export type AgentTraceWriter = (message: string) => void;
 export type AgentRunOptions = {
   maxSteps?: number;
   validationCycles?: number;
+  validationMode?: ValidationMode;
+  contextWindowTokens?: number;
+  promptBudgetTokens?: number;
+  maxOutputTokens?: number;
   trace?: AgentTraceWriter;
   toolContext?: ToolContext;
   toolExecutor?: ToolExecutor;
 };
 
+type ResolvedAgentRunOptions = {
+  maxSteps: number;
+  validationCycles: number;
+  validationMode: ValidationMode;
+  contextWindowTokens?: number;
+  promptBudgetTokens?: number;
+  maxOutputTokens: number;
+  trace: AgentTraceWriter;
+  toolContext: ToolContext;
+  toolExecutor: ToolExecutor;
+};
+
+type PromptBudgetOptions = Pick<
+  ResolvedAgentRunOptions,
+  "contextWindowTokens" | "promptBudgetTokens" | "maxOutputTokens"
+>;
+
+type ToolTurn = {
+  assistant: TranscriptMessage;
+  user: TranscriptMessage;
+};
+
+type PendingValidationTurn = ToolTurn | null;
+
+function resolvePositiveIntegerOption(
+  name: string,
+  value: number | undefined,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`Invalid ${name}: ${String(value)}. Expected a positive integer.`);
+  }
+
+  return value;
+}
+
+function estimateTokenCount(value: string) {
+  return Math.max(1, Math.ceil(value.length / 4));
+}
+
+function estimateTranscriptTokens(messages: TranscriptMessage[]) {
+  return messages.reduce(
+    (total, message) =>
+      total + estimateTokenCount(message.role) + estimateTokenCount(message.content) + 2,
+    0,
+  );
+}
+
+function getPromptBudgetError(
+  messages: TranscriptMessage[],
+  options: PromptBudgetOptions,
+  stepNumber: number,
+) {
+  const promptTokens = estimateTranscriptTokens(messages);
+
+  if (
+    options.promptBudgetTokens !== undefined &&
+    promptTokens > options.promptBudgetTokens
+  ) {
+    return `Estimated prompt size ${promptTokens} tokens exceeds prompt budget ${options.promptBudgetTokens} before step ${stepNumber}.`;
+  }
+
+  if (
+    options.contextWindowTokens !== undefined &&
+    promptTokens + options.maxOutputTokens > options.contextWindowTokens
+  ) {
+    return `Estimated prompt plus output size ${promptTokens + options.maxOutputTokens} tokens exceeds context window ${options.contextWindowTokens} before step ${stepNumber}.`;
+  }
+
+  return null;
+}
+
+function assertPromptFitsBudget(
+  messages: TranscriptMessage[],
+  options: PromptBudgetOptions,
+  stepNumber: number,
+) {
+  const error = getPromptBudgetError(messages, options, stepNumber);
+  if (error) {
+    throw new Error(error);
+  }
+}
+
+function shouldRunValidationCycle(
+  validationMode: ValidationMode,
+  remainingValidationCycles: number,
+  hasToolEvidence: boolean,
+) {
+  if (remainingValidationCycles <= 0 || validationMode === "off") {
+    return false;
+  }
+
+  if (validationMode === "after_tool") {
+    return hasToolEvidence;
+  }
+
+  return true;
+}
+
+function fitsPromptBudget(
+  messages: TranscriptMessage[],
+  options: PromptBudgetOptions,
+) {
+  return getPromptBudgetError(messages, options, 0) === null;
+}
+
+function flattenToolTurns(toolTurns: ToolTurn[]) {
+  return toolTurns.flatMap((turn) => [turn.assistant, turn.user]);
+}
+
+function buildMessagesForStep(
+  systemPrompt: string,
+  input: string,
+  completedToolTurns: ToolTurn[],
+  pendingValidationTurn: PendingValidationTurn,
+  budgetOptions: PromptBudgetOptions,
+) {
+  const baseMessages: TranscriptMessage[] = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: input },
+  ];
+  const trailingMessages = pendingValidationTurn
+    ? [pendingValidationTurn.assistant, pendingValidationTurn.user]
+    : [];
+  let selectedTurns: ToolTurn[] = [];
+
+  for (let index = completedToolTurns.length - 1; index >= 0; index--) {
+    const toolTurn = completedToolTurns[index];
+    if (!toolTurn) {
+      continue;
+    }
+
+    const candidateTurns = [toolTurn, ...selectedTurns];
+    const candidateMessages = [
+      ...baseMessages,
+      ...flattenToolTurns(candidateTurns),
+      ...trailingMessages,
+    ];
+    if (!fitsPromptBudget(candidateMessages, budgetOptions)) {
+      break;
+    }
+
+    selectedTurns = candidateTurns;
+  }
+
+  return [...baseMessages, ...flattenToolTurns(selectedTurns), ...trailingMessages];
+}
+
 function resolveAgentRunOptions(
   options: AgentRunOptions = {},
-): Required<AgentRunOptions> {
+): ResolvedAgentRunOptions {
+  const maxSteps = options.maxSteps ?? MAX_AGENT_STEPS;
+  if (!Number.isInteger(maxSteps) || maxSteps <= 0) {
+    throw new Error(
+      `Invalid maxSteps: ${String(maxSteps)}. Expected a positive integer.`,
+    );
+  }
+
   const validationCycles = options.validationCycles ?? DEFAULT_VALIDATION_CYCLES;
   if (!Number.isInteger(validationCycles) || validationCycles < 0) {
     throw new Error(
@@ -72,9 +232,42 @@ function resolveAgentRunOptions(
     );
   }
 
+  const validationMode = options.validationMode ?? DEFAULT_VALIDATION_MODE;
+  if (!VALIDATION_MODES.includes(validationMode)) {
+    throw new Error(
+      `Invalid validationMode: ${String(validationMode)}. Expected one of ${VALIDATION_MODES.join(", ")}.`,
+    );
+  }
+
+  const contextWindowTokens = resolvePositiveIntegerOption(
+    "contextWindowTokens",
+    options.contextWindowTokens,
+  );
+  const promptBudgetTokens = resolvePositiveIntegerOption(
+    "promptBudgetTokens",
+    options.promptBudgetTokens,
+  );
+  const maxOutputTokens =
+    resolvePositiveIntegerOption("maxOutputTokens", options.maxOutputTokens) ??
+    DEFAULT_MAX_OUTPUT_TOKENS;
+
+  if (
+    contextWindowTokens !== undefined &&
+    promptBudgetTokens !== undefined &&
+    promptBudgetTokens + maxOutputTokens > contextWindowTokens
+  ) {
+    throw new Error(
+      `Invalid budget settings: promptBudgetTokens (${promptBudgetTokens}) plus maxOutputTokens (${maxOutputTokens}) exceeds contextWindowTokens (${contextWindowTokens}).`,
+    );
+  }
+
   return {
-    maxSteps: options.maxSteps ?? MAX_AGENT_STEPS,
+    maxSteps,
     validationCycles,
+    validationMode,
+    contextWindowTokens,
+    promptBudgetTokens,
+    maxOutputTokens,
     trace: options.trace ?? (() => undefined),
     toolContext: options.toolContext ?? createToolContext(),
     toolExecutor: options.toolExecutor ?? defaultExecuteToolCall,
@@ -114,20 +307,53 @@ function createValidationMessage(
 }
 
 export type RunAgentOptions = ModelClientOptions &
-  Pick<AgentRunOptions, "maxSteps" | "validationCycles" | "trace">;
+  Pick<
+    AgentRunOptions,
+    | "maxSteps"
+    | "validationCycles"
+    | "validationMode"
+    | "contextWindowTokens"
+    | "promptBudgetTokens"
+    | "maxOutputTokens"
+    | "trace"
+  >;
 
 export async function runAgent(
   input: string,
   baseUrl: string,
   options: RunAgentOptions = {},
 ) {
-  const { maxSteps, validationCycles, trace, ...modelOptions } = options;
-
-  return runAgentWithModel(input, createModelClient(baseUrl, modelOptions), {
+  const {
     maxSteps,
     validationCycles,
+    validationMode,
+    contextWindowTokens,
+    promptBudgetTokens,
+    maxOutputTokens,
+    maxTokens,
     trace,
-  });
+    ...modelOptions
+  } = options;
+  const resolvedMaxOutputTokens = maxOutputTokens ?? maxTokens;
+
+  return runAgentWithModel(
+    input,
+    createModelClient(baseUrl, {
+      ...modelOptions,
+      ...(resolvedMaxOutputTokens !== undefined
+        ? { maxOutputTokens: resolvedMaxOutputTokens }
+        : {}),
+    }),
+    {
+      maxSteps,
+      validationCycles,
+      validationMode,
+      contextWindowTokens,
+      promptBudgetTokens,
+      maxOutputTokens: resolvedMaxOutputTokens,
+      trace,
+    },
+  );
 }
 
 export async function runAgentWithModel(
@@ -135,42 +361,81 @@ export async function runAgentWithModel(
   model: ModelClient,
   options: AgentRunOptions = {},
 ) {
-  const { maxSteps, validationCycles, trace, toolContext, toolExecutor } =
-    resolveAgentRunOptions(options);
-  const messages: TranscriptMessage[] = [
-    { role: "system", content: buildSystemPrompt(validationCycles) },
-    { role: "user", content: input },
-  ];
+  const {
+    maxSteps,
+    validationCycles,
+    validationMode,
+    contextWindowTokens,
+    promptBudgetTokens,
+    maxOutputTokens,
+    trace,
+    toolContext,
+    toolExecutor,
+  } = resolveAgentRunOptions(options);
+  const systemPrompt = buildSystemPrompt(validationCycles, validationMode);
+  const budgetOptions: PromptBudgetOptions = {
+    contextWindowTokens,
+    promptBudgetTokens,
+    maxOutputTokens,
+  };
+  const completedToolTurns: ToolTurn[] = [];
+  let pendingValidationTurn: PendingValidationTurn = null;
   let lastResult: ModelResult | null = null;
   let remainingValidationCycles = validationCycles;
+  let hasToolEvidence = false;
 
-  trace(
-    `Starting agent run with maxSteps=${maxSteps} and validationCycles=${validationCycles}.`,
-  );
+  const startDetails = [
+    `maxSteps=${maxSteps}`,
+    `validationMode=${validationMode}`,
+    `validationCycles=${validationCycles}`,
+    `maxOutputTokens=${maxOutputTokens}`,
+  ];
+  if (contextWindowTokens !== undefined) {
+    startDetails.push(`contextWindowTokens=${contextWindowTokens}`);
+  }
+  if (promptBudgetTokens !== undefined) {
+    startDetails.push(`promptBudgetTokens=${promptBudgetTokens}`);
+  }
+  trace(`Starting agent run with ${startDetails.join(", ")}.`);
 
   for (let step = 0; step < maxSteps; step++) {
     const stepNumber = step + 1;
     trace(`Step ${stepNumber}/${maxSteps}: requesting model response.`);
+    const messages = buildMessagesForStep(
+      systemPrompt,
+      input,
+      completedToolTurns,
+      pendingValidationTurn,
+      budgetOptions,
+    );
+    assertPromptFitsBudget(messages, budgetOptions, stepNumber);
     const result = await model(messages);
     lastResult = result;
+    pendingValidationTurn = null;
 
     if (result.type === "final") {
-      if (remainingValidationCycles > 0) {
+      if (
+        shouldRunValidationCycle(
+          validationMode,
+          remainingValidationCycles,
+          hasToolEvidence,
+        )
+      ) {
         const cycleNumber = validationCycles - remainingValidationCycles + 1;
         trace(
           `Step ${stepNumber}/${maxSteps}: draft answer produced. Starting validation cycle ${cycleNumber}/${validationCycles}.`,
         );
-        messages.push({
-          role: "assistant",
-          content: JSON.stringify(result),
-        });
-        messages.push(
-          createValidationMessage(
+        pendingValidationTurn = {
+          assistant: {
+            role: "assistant",
+            content: JSON.stringify(result),
+          },
+          user: createValidationMessage(
             cycleNumber,
             validationCycles,
             result.text,
           ),
-        );
+        };
         remainingValidationCycles -= 1;
         continue;
       }
@@ -182,10 +447,6 @@ export async function runAgentWithModel(
     trace(
       `Step ${stepNumber}/${maxSteps}: calling tool ${result.tool} with arguments ${JSON.stringify(result.arguments)}.`,
     );
-    messages.push({
-      role: "assistant",
-      content: JSON.stringify(result),
-    });
 
     const toolOutput = await toolExecutor(result, toolContext);
     if (toolOutput.ok) {
@@ -196,13 +457,19 @@ export async function runAgentWithModel(
       );
     }
     remainingValidationCycles = validationCycles;
-    if (validationCycles > 0) {
+    hasToolEvidence = true;
+    completedToolTurns.push({
+      assistant: {
+        role: "assistant",
+        content: JSON.stringify(result),
+      },
+      user: createToolResultMessage(toolOutput),
+    });
+    if (validationMode !== "off" && validationCycles > 0) {
       trace(
         `Step ${stepNumber}/${maxSteps}: validation cycle reset after new tool evidence.`,
       );
     }
-
-    messages.push(createToolResultMessage(toolOutput));
   }
 
   trace(`Stopped after ${maxSteps} step(s) without an accepted final answer.`);

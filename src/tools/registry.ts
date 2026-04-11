@@ -58,6 +58,13 @@ function describeArguments(schema: AnyToolDefinition["schema"]) {
     .join(", ")}`;
 }
 
+function trimPromptSentence(value: string) {
+  return value
+    .trim()
+    .replace(/^Use when\s+/i, "")
+    .replace(/\.$/, "");
+}
+
 export class ToolRegistry {
   private readonly definitions: readonly AnyToolDefinition[];
   private readonly definitionMap: ReadonlyMap<string, AnyToolDefinition>;
@@ -82,7 +89,7 @@ export class ToolRegistry {
       (definition) => {
         const argumentDescription = describeArguments(definition.schema);
 
-        return `- ${definition.name}: ${definition.description}. Use when: ${definition.whenToUse}. ${argumentDescription}. Example arguments: ${JSON.stringify(definition.exampleArgs)}`;
+        return `- ${definition.name}: ${trimPromptSentence(definition.description)}. Use when: ${trimPromptSentence(definition.whenToUse)}. ${argumentDescription}. Example arguments: ${JSON.stringify(definition.exampleArgs)}`;
       },
     );
   }

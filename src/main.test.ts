@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test";
 
 import { ModelClientError } from "./llm";
-import { formatCliError, main, parseCliArgs } from "./main";
+import {
+  formatCliError,
+  main,
+  parseCliArgs,
+  resolveCliRuntimeOptions,
+} from "./main";
 
 test("parses input and base-url arguments", () => {
   expect(
@@ -20,6 +25,7 @@ test("parses input and base-url arguments", () => {
     input: "What's the weather?",
     baseUrl: "http://127.0.0.1:9999",
     quiet: false,
+    profile: "local-14b",
     showHelp: false,
     model: "test-model",
     timeoutMs: 5000,
@@ -31,6 +37,7 @@ test("does not default to a hidden Perth query when no input is provided", () =>
     input: null,
     baseUrl: "http://127.0.0.1:9000",
     quiet: false,
+    profile: "local-14b",
     showHelp: false,
   });
 });
@@ -40,12 +47,14 @@ test("supports help flags", () => {
     input: null,
     baseUrl: "http://127.0.0.1:9000",
     quiet: false,
+    profile: "local-14b",
     showHelp: true,
   });
   expect(parseCliArgs(["-h"])).toEqual({
     input: null,
     baseUrl: "http://127.0.0.1:9000",
     quiet: false,
+    profile: "local-14b",
     showHelp: true,
   });
 });
@@ -55,6 +64,7 @@ test("supports quiet flag", () => {
     input: "Hello",
     baseUrl: "http://127.0.0.1:9000",
     quiet: true,
+    profile: "local-14b",
     showHelp: false,
   });
 });
@@ -93,6 +103,24 @@ test("rejects missing or invalid model client option values", () => {
   expect(() => parseCliArgs(["--timeout-ms", "abc", "hello"])).toThrow(
     "Invalid value for --timeout-ms: abc",
   );
+  expect(() => parseCliArgs(["--profile", "remote", "hello"])).toThrow(
+    "Invalid value for --profile: remote. Expected one of default, local-14b",
+  );
+  expect(() => parseCliArgs(["--validation", "sometimes", "hello"])).toThrow(
+    "Invalid value for --validation: sometimes. Expected one of always, after_tool, off",
+  );
+  expect(() => parseCliArgs(["--max-steps", "0", "hello"])).toThrow(
+    "Invalid value for --max-steps: 0",
+  );
+  expect(() => parseCliArgs(["--context-window", "abc", "hello"])).toThrow(
+    "Invalid value for --context-window: abc",
+  );
+  expect(() => parseCliArgs(["--prompt-budget", "0", "hello"])).toThrow(
+    "Invalid value for --prompt-budget: 0",
+  );
+  expect(() => parseCliArgs(["--max-output-tokens", "0", "hello"])).toThrow(
+    "Invalid value for --max-output-tokens: 0",
+  );
 });
 
 test("treats tokens after -- as prompt text", () => {
@@ -100,7 +128,37 @@ test("treats tokens after -- as prompt text", () => {
     input: "--base-url hello",
     baseUrl: "http://127.0.0.1:9000",
     quiet: false,
+    profile: "local-14b",
     showHelp: false,
+  });
+});
+
+test("resolves local-14b runtime defaults and allows explicit overrides", () => {
+  expect(
+    resolveCliRuntimeOptions(
+      parseCliArgs([
+        "--profile",
+        "local-14b",
+        "--max-steps",
+        "6",
+        "--validation",
+        "off",
+        "--context-window",
+        "28000",
+        "--prompt-budget",
+        "16000",
+        "--max-output-tokens",
+        "512",
+        "Hello",
+      ]),
+    ),
+  ).toEqual({
+    maxSteps: 6,
+    validationCycles: 1,
+    validationMode: "off",
+    contextWindowTokens: 28000,
+    promptBudgetTokens: 16000,
+    maxOutputTokens: 512,
   });
 });
 
@@ -112,6 +170,12 @@ test("main forwards parsed options to runAgent", async () => {
         options: {
           model?: string;
           timeoutMs?: number;
+          maxSteps?: number;
+          validationCycles?: number;
+          validationMode?: string;
+          contextWindowTokens?: number;
+          promptBudgetTokens?: number;
+          maxOutputTokens?: number;
           trace?: (message: string) => void;
         };
       }
@@ -145,6 +209,12 @@ test("main forwards parsed options to runAgent", async () => {
   expect(captured?.baseUrl).toBe("http://127.0.0.1:9999");
   expect(captured?.options.model).toBe("test-model");
   expect(captured?.options.timeoutMs).toBe(5000);
+  expect(captured?.options.maxSteps).toBe(4);
+  expect(captured?.options.validationCycles).toBe(1);
+  expect(captured?.options.validationMode).toBe("after_tool");
+  expect(captured?.options.contextWindowTokens).toBe(32768);
+  expect(captured?.options.promptBudgetTokens).toBe(18000);
+  expect(captured?.options.maxOutputTokens).toBe(640);
   expect(captured?.options.trace).toBeTypeOf("function");
 });
 
@@ -156,6 +226,12 @@ test("main suppresses trace forwarding in quiet mode", async () => {
         options: {
           model?: string;
           timeoutMs?: number;
+          maxSteps?: number;
+          validationCycles?: number;
+          validationMode?: string;
+          contextWindowTokens?: number;
+          promptBudgetTokens?: number;
+          maxOutputTokens?: number;
           trace?: (message: string) => void;
         };
       }
@@ -174,6 +250,12 @@ test("main suppresses trace forwarding in quiet mode", async () => {
 
   expect(captured?.input).toBe("Hello");
   expect(captured?.baseUrl).toBe("http://127.0.0.1:9000");
+  expect(captured?.options.maxSteps).toBe(4);
+  expect(captured?.options.validationCycles).toBe(1);
+  expect(captured?.options.validationMode).toBe("after_tool");
+  expect(captured?.options.contextWindowTokens).toBe(32768);
+  expect(captured?.options.promptBudgetTokens).toBe(18000);
+  expect(captured?.options.maxOutputTokens).toBe(640);
   expect(captured?.options.trace).toBeUndefined();
 });
 

@@ -7,18 +7,19 @@ import type { ToolExecutionResult } from "./tools/base";
 test("returns a direct final answer without using a tool", async () => {
   const model: ModelClient = async (messages) => {
     expect(messages).toHaveLength(2);
-    expect(messages[0]?.content).toContain("Question every requirement");
-    expect(messages[0]?.content).toContain("Delete unnecessary parts, steps, and assumptions");
-    expect(messages[0]?.content).toContain("Automate only after the process is stable and worth repeating");
+    expect(messages[0]?.content).toContain("Use first-principles reasoning");
     expect(messages[0]?.content).toContain(
-      "Use a tool only when the user's request actually requires that tool",
+      "Prefer the smallest truthful answer grounded in the request and tool results.",
     );
     expect(messages[0]?.content).toContain(
-      "Do not invent missing tool arguments or facts",
+      "Use a tool only when needed.",
+    );
+    expect(messages[0]?.content).toContain(
+      "Do not invent facts or missing tool arguments.",
     );
     expect(messages[0]?.content).toContain('"type":"final"');
     expect(messages[0]?.content).toContain('"type":"tool"');
-    expect(messages[0]?.content).toContain("Use when:");
+    expect(messages[0]?.content).toContain("Tools:");
     expect(messages[1]).toEqual({ role: "user", content: "Hello" });
 
     return { type: "final", text: "Hi there." };
@@ -27,6 +28,28 @@ test("returns a direct final answer without using a tool", async () => {
   await expect(
     runAgentWithModel("Hello", model, { validationCycles: 0 }),
   ).resolves.toBe("Hi there.");
+});
+
+test("after_tool validation mode accepts direct final answers without extra turns", async () => {
+  let callCount = 0;
+  const model: ModelClient = async (messages) => {
+    callCount += 1;
+    expect(messages).toHaveLength(2);
+    expect(messages[0]?.content).toContain(
+      "The runtime may request up to 1 validation pass(es).",
+    );
+
+    return { type: "final", text: "Hi there." };
+  };
+
+  await expect(
+    runAgentWithModel("Hello", model, {
+      validationCycles: 1,
+      validationMode: "after_tool",
+    }),
+  ).resolves.toBe("Hi there.");
+
+  expect(callCount).toBe(1);
 });
 
 test("supports multiple tool turns before the final answer", async () => {
@@ -130,6 +153,14 @@ test("supports multiple tool turns before the final answer", async () => {
       tool: "get_weather",
       arguments: { city: "Berlin", country: "Germany" },
     }),
+  });
+  expect(calls[2]?.[5]).toEqual({
+    role: "user",
+    content: [
+      "Tool result:",
+      JSON.stringify(toolResults.get(JSON.stringify({ city: "Berlin", country: "Germany" }))),
+      "Use this result to continue. Respond ONLY with valid JSON.",
+    ].join("\n"),
   });
 });
 
@@ -237,7 +268,7 @@ test("performs multiple validation cycles before accepting a final answer", asyn
 
     if (calls.length === 1) {
       expect(messages[0]?.content).toContain(
-        "The runtime will enforce 2 validation cycle(s) before it accepts any final answer.",
+        "The runtime may request up to 2 validation pass(es).",
       );
       return { type: "final", text: "Initial answer." };
     }
@@ -265,14 +296,14 @@ test("performs multiple validation cycles before accepting a final answer", asyn
       return { type: "final", text: "Revised answer." };
     }
 
-    expect(messages[4]).toEqual({
+    expect(messages[2]).toEqual({
       role: "assistant",
       content: JSON.stringify({
         type: "final",
         text: "Revised answer.",
       }),
     });
-    expect(messages[5]).toEqual({
+    expect(messages[3]).toEqual({
       role: "user",
       content: [
         "Validation cycle 2 of 2.",
@@ -328,7 +359,7 @@ test("restarts validation cycles after a tool call adds new evidence", async () 
     }
 
     if (calls.length === 3) {
-      expect(messages[5]).toEqual({
+      expect(messages[3]).toEqual({
         role: "user",
         content: [
           "Tool result:",
@@ -350,10 +381,27 @@ test("restarts validation cycles after a tool call adds new evidence", async () 
           "Use this result to continue. Respond ONLY with valid JSON.",
         ].join("\n"),
       });
+      expect(messages[2]).toEqual({
+        role: "assistant",
+        content: JSON.stringify({
+          type: "tool",
+          tool: "search_web",
+          arguments: { query: "latest result" },
+        }),
+      });
       return { type: "final", text: "Answer with evidence." };
     }
 
-    expect(messages[7]?.content).toContain("Validation cycle 1 of 1.");
+    expect(messages[2]).toEqual({
+      role: "assistant",
+      content: JSON.stringify({
+        type: "tool",
+        tool: "search_web",
+        arguments: { query: "latest result" },
+      }),
+    });
+    expect(messages[3]?.content).toContain('"query":"latest result"');
+    expect(messages[5]?.content).toContain("Validation cycle 1 of 1.");
     return { type: "final", text: "Best checked answer." };
   };
 
@@ -416,7 +464,7 @@ test("emits trace lines for model turns, validation, and tool execution", async 
   ).resolves.toBe("Best checked answer.");
 
   expect(trace).toEqual([
-    "Starting agent run with maxSteps=12 and validationCycles=1.",
+    "Starting agent run with maxSteps=12, validationMode=always, validationCycles=1, maxOutputTokens=400.",
     "Step 1/12: requesting model response.",
     "Step 1/12: draft answer produced. Starting validation cycle 1/1.",
     "Step 2/12: requesting model response.",
@@ -430,6 +478,23 @@ test("emits trace lines for model turns, validation, and tool execution", async 
   ]);
 });
 
+test("fails before calling the model when the estimated prompt exceeds the prompt budget", async () => {
+  let called = false;
+  const model: ModelClient = async () => {
+    called = true;
+    return { type: "final", text: "Hi" };
+  };
+
+  await expect(
+    runAgentWithModel("Hello", model, {
+      validationCycles: 0,
+      promptBudgetTokens: 1,
+    }),
+  ).rejects.toThrow("Estimated prompt size");
+
+  expect(called).toBe(false);
+});
+
 test("rejects invalid validation cycle counts", async () => {
   const model: ModelClient = async () => ({ type: "final", text: "Hi" });
 
@@ -437,5 +502,17 @@ test("rejects invalid validation cycle counts", async () => {
     runAgentWithModel("Hello", model, { validationCycles: -1 }),
   ).rejects.toThrow(
     "Invalid validationCycles: -1. Expected a non-negative integer.",
+  );
+});
+
+test("rejects invalid validation modes", async () => {
+  const model: ModelClient = async () => ({ type: "final", text: "Hi" });
+
+  await expect(
+    runAgentWithModel("Hello", model, {
+      validationMode: "sometimes" as never,
+    }),
+  ).rejects.toThrow(
+    "Invalid validationMode: sometimes. Expected one of always, after_tool, off.",
   );
 });

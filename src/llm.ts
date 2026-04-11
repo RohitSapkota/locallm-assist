@@ -30,7 +30,7 @@ export type ModelClient = (
 const responseTextSchema = z.string();
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_TEMPERATURE = 0;
-const DEFAULT_MAX_TOKENS = 400;
+export const DEFAULT_MAX_OUTPUT_TOKENS = 400;
 const SUPPORTED_PROTOCOLS = new Set(["http:", "https:"]);
 
 type ModelClientErrorCode =
@@ -56,6 +56,7 @@ export type ModelClientOptions = {
   timeoutMs?: number;
   temperature?: number;
   maxTokens?: number;
+  maxOutputTokens?: number;
   fetchImpl?: typeof fetch;
 };
 
@@ -107,7 +108,19 @@ function resolveModelClientOptions(
     );
   }
 
-  const maxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
+  if (
+    options.maxTokens !== undefined &&
+    options.maxOutputTokens !== undefined &&
+    options.maxTokens !== options.maxOutputTokens
+  ) {
+    throw new ModelClientError(
+      "config",
+      `Conflicting model max token values: maxTokens=${options.maxTokens}, maxOutputTokens=${options.maxOutputTokens}`,
+    );
+  }
+
+  const maxTokens =
+    options.maxOutputTokens ?? options.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
     throw new ModelClientError(
       "config",

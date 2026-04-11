@@ -110,6 +110,42 @@ test("createModelClient posts messages and parses a successful response", async 
   });
 });
 
+test("createModelClient accepts maxOutputTokens as the public alias", async () => {
+  let capturedInit: RequestInit | undefined;
+
+  const fetchMock = (async (
+    _: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    capturedInit = init;
+
+    return new Response(
+      JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: '{"type":"final","text":"Hello from model"}',
+            },
+          },
+        ],
+      }),
+      { status: 200 },
+    );
+  }) as unknown as typeof fetch;
+
+  const client = createModelClient("http://127.0.0.1:9000", {
+    maxOutputTokens: 256,
+    fetchImpl: fetchMock,
+  });
+
+  await expect(client([{ role: "user", content: "hello" }])).resolves.toEqual({
+    type: "final",
+    text: "Hello from model",
+  });
+
+  expect(JSON.parse(String(capturedInit?.body)).max_tokens).toBe(256);
+});
+
 test("createModelClient surfaces non-200 responses", async () => {
   const fetchMock = (async () =>
     new Response("Bad gateway", { status: 502 })) as unknown as typeof fetch;
@@ -223,6 +259,14 @@ test("createModelClient validates base URL and options", () => {
   expect(() =>
     createModelClient("http://127.0.0.1:9000", { maxTokens: 0 }),
   ).toThrow("Invalid model maxTokens: 0");
+  expect(() =>
+    createModelClient("http://127.0.0.1:9000", {
+      maxTokens: 100,
+      maxOutputTokens: 200,
+    }),
+  ).toThrow(
+    "Conflicting model max token values: maxTokens=100, maxOutputTokens=200",
+  );
   expect(() =>
     createModelClient("http://127.0.0.1:9000", { model: "   " }),
   ).toThrow("Invalid model name: must be a non-empty string");

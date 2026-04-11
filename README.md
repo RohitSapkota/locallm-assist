@@ -36,6 +36,22 @@ To pass an explicit model name and request timeout:
 bun run src/main.ts --model my-model --timeout-ms 15000 -- "What's the weather in Perth, Western Australia?"
 ```
 
+The CLI now defaults to the `local-14b` runtime profile. This matches Qwen2.5-14B's default context setup more closely: 32,768 tokens by default, with 131,072 available only if you explicitly enable YaRN or another long-context configuration in your backend. The runtime still keeps a conservative prompt budget because this project currently uses a rough token estimate instead of the model's exact tokenizer:
+
+- `maxSteps=4`
+- `validationMode=after_tool`
+- `validationCycles=1`
+- `contextWindowTokens=32768`
+- `promptBudgetTokens=18000`
+- `maxOutputTokens=640`
+
+To switch back to the legacy higher-latency defaults or override only one limit:
+
+```bash
+bun run src/main.ts --profile default -- "What's the weather in Perth, Western Australia?"
+bun run src/main.ts --max-output-tokens 512 --max-steps 3 -- "Summarize the latest Bun release notes"
+```
+
 To print CLI help:
 
 ```bash
@@ -57,11 +73,15 @@ bun run src/main.ts --quiet -- "What's the weather in Perth, Western Australia?"
 The CLI no longer falls back to a hidden default prompt. You must pass an explicit request.
 Unknown flags are rejected, and `--base-url` must be a valid `http` or `https` URL.
 `--timeout-ms` must be a positive integer.
+`--max-steps`, `--context-window`, `--prompt-budget`, and `--max-output-tokens` must be positive integers.
+`--validation` must be one of `always`, `after_tool`, or `off`.
 Use `--quiet` to suppress backend progress trace output.
 
 This project now defaults to first-principles reasoning plus the 5-step improvement loop documented in [AGENTS.md](./AGENTS.md). The runtime agent prompt follows the same standard by default.
 
-The runtime now also enforces two validation cycles before it accepts a final answer. After each draft answer, the agent is prompted to check for unsupported claims, contradictions, stale assumptions, missing edge cases, and calculation mistakes. If a review finds a gap, it can call another tool and restart the validation cycle with the new evidence.
+The default `local-14b` profile runs one validation cycle only after new tool evidence. If you switch to `--profile default`, the older two-cycle always-validate behavior is still available.
+
+The runtime no longer replays the full raw transcript on every step. It rebuilds a compact prompt each turn from the original request, a bounded summary of prior tool facts, and the current pending tool or validation turn. This keeps prompt growth flatter on smaller local models.
 
 When you run the CLI, backend progress is printed to `stderr` with `[agent]` prefixes so you can see model turns, validation passes, and tool calls while the final answer remains on `stdout`.
 
